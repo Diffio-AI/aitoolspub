@@ -17,27 +17,38 @@ See how AI search engines answer a question, for SEO / AEO / GEO work: the queri
 back, the text they read from each, what they open, and what they cite. trace_query returns two independent full
 traces, unfiltered. test_page_change replays the open model's trace up to where it saw your page and swaps in your
 dev site's version, to see whether a change would alter its answer. sample_queries shows which first searches the
-open model writes for a question. The tools collect data and do no analysis."""
+open model writes for a question. preview_excerpts shows, per search query, which passages of a page (production and
+dev) the search engine hands the open model. The tools collect data and do no analysis."""
 
 TEST_DESCRIPTION = """\
 Would a page change alter the open model's answer? Takes a trace_query trace (by trace_id, or a query, which uses
 or makes one) in which DeepSeek saw a page on one of your domains, and replays DeepSeek's conversation exactly as it
 was up to that point (same tool definitions, results and text as OpenRouter gave it). There it swaps the page's text
 and lets DeepSeek carry on, `runs` times per arm:
-- control: the production page, re-extracted with Exa's live crawl (passages matched to the same query, sized like
-  the original excerpt);
+- control: the production page, re-extracted with Exa's live crawl (passages matched to the same query, at the
+  length Exa picks, as for OpenRouter);
 - variant: your dev page (the domain mapped to its dev host, same path), extracted the same way. The model always
   sees the production URL, and the dev host in the text is rewritten to production.
 Both arms extract the same way, so only the page content differs; continuing is random, hence several runs each.
 After the branch point DeepSeek's new searches are run by OpenRouter's own search tool (exactly production's
 results and excerpts); on your domains, control keeps production's excerpt and variant gets the dev page's passages.
 
-Returns a summary: the branch point, the swapped text sizes, and per run whether the answer linked or named the
-domain, with the answer's lines about it quoted (a link can be a warning). Files: swaps.md (original, control and
+Returns a summary: the branch point, the passage the model read from the page in the original and in the variant,
+and per run whether the answer linked or named the domain, with the answer's lines and the model's reasoning about
+the domain quoted (a link can be a warning; the reasoning says what it made of the page and why it preferred
+others). Extraction varies between calls (OpenRouter's own excerpt matches its rerun ~75%), so the swapped text
+approximates what the model would get; preview_excerpts shows it per query, fast. Files: swaps.md (original, control and
 variant text), control-N.md and variant-N.md (each continuation in full), test.json.
 
-Fails with a clear message if the trace's open model never saw a page on the domains (nothing to swap); see
-sample_queries for what it searches for instead. OpenAI can't be replayed (its search runs inside OpenAI). About
+Insert mode (insert_url): for questions where the page doesn't show up. The page is added to one of the trace's
+searches (the first, or the one matching insert_query) at insert_rank, as if it ranked there; the list keeps its
+length. Variant: the dev page's passages for that search's query. Control: the search as recorded
+(insert_control 'absent': would ranking there win anything?) or the production page inserted the same way
+('production': would the dev change win more if it ranked?). It can't make the page rank: that's search, not the
+model.
+
+Without insert_url, fails with a clear message if the trace's open model never saw a page on the domains (nothing to
+swap). OpenAI can't be replayed (its search runs inside OpenAI). About
 10-90 seconds; roughly $0.002-0.01 per run in OpenRouter plus Exa ($0.007 per new search, $0.002 per page
 extraction or fetch): a 3-run test is typically $0.02-0.10."""
 
@@ -47,6 +58,21 @@ first for a question? Runs it n times only until it asks for its first search or
 with how often it was written, plus how many samples used each word. No search is run: about 3-10 seconds and
 well under a cent for 20 samples. Only the first turn: later queries depend on what the results said (see
 trace_query for those)."""
+
+PREVIEW_DESCRIPTION = """\
+Which passages of a page does the search engine hand the open model, and what would a dev change put there? For
+each query: the passages Exa picks from the production page and from its dev version now (live crawl, Exa's own
+length; OpenRouter passes these to the model unchanged when the page is a search result), plus what the open model
+actually got from the page in cached traces, and how much of that today's production passages contain.
+
+The model never reads the whole page from a search, only these passages, so this is the fast check while editing:
+whether the page's case reaches the model for the queries it ranks for. With no queries it uses every search query
+under which a cached trace's open model got this URL (sample_queries finds queries for pages never seen).
+
+Approximate: the passages run about twice as long as what the model gets, and Exa's choice varies between calls
+(OpenRouter's excerpt matches its own rerun ~75%). Read them as what the page offers per query. A few seconds; about
+$0.001-0.002 per page per query. The summary shows each query's dev (or production) passage start; every passage in
+full is in the saved file."""
 
 DESCRIPTION = """\
 Run one question through two independent AI web searches, save both full traces as files, and return where they
@@ -113,10 +139,22 @@ def build() -> MCPServer:
         runs: Annotated[int, Field(description="Continuations per arm (control and variant), 1-10", ge=1, le=10)] = 3,
         save_dir: Annotated[str | None, Field(description="Absolute path of a directory to save the test folder "
                                                           f"in. Default {core.STATE_DIR / 'tests'}")] = None,
+        insert_url: Annotated[str | None, Field(
+            description="Insert mode: the production URL of the page to add to a search where it didn't show up, "
+                        "e.g. 'https://example.com/pricing'")] = None,
+        insert_rank: Annotated[int, Field(description="Insert mode: its position in the results, 1 = top", ge=1,
+                                          le=25)] = 3,
+        insert_query: Annotated[str | None, Field(
+            description="Insert mode: which of the trace's searches to insert into, by its exact query. Default: "
+                        "the first search")] = None,
+        insert_control: Annotated[Literal["absent", "production"], Field(
+            description="Insert mode: control is the search as recorded ('absent') or with the production page "
+                        "inserted the same way ('production')")] = "absent",
     ) -> str:
         try:
             test = await replay.test_page_change(domains, trace_id=trace_id, query=query, runs=runs,
-                                                 save_dir=save_dir)
+                                                 save_dir=save_dir, insert_url=insert_url, insert_rank=insert_rank,
+                                                 insert_query=insert_query, insert_control=insert_control)
         except core.TraceError as e:
             raise ToolError(str(e))
         except Exception as e:  # noqa: BLE001
@@ -136,6 +174,27 @@ def build() -> MCPServer:
         except Exception as e:  # noqa: BLE001
             raise ToolError(f"sample_queries failed: {type(e).__name__}: {str(e)[:300]}. Retry once.")
         return render_queries(r)
+
+    @mcp.tool(description=PREVIEW_DESCRIPTION, structured_output=False,
+              annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True, idempotentHint=False))
+    async def preview_excerpts(
+        url: Annotated[str, Field(description="The production URL, e.g. 'https://example.com/pricing'")],
+        domains: Annotated[dict[str, str] | None, Field(
+            description="Production domain mapped to its dev host, e.g. {'example.com': "
+                        "'dev.example.com'}, to preview the dev version too")] = None,
+        queries: Annotated[list[str] | None, Field(
+            description="Search queries as a model writes them (up to 20). Default: every query under which a "
+                        "cached trace's open model got this URL")] = None,
+        save_dir: Annotated[str | None, Field(description="Absolute path of a directory for the preview file. "
+                                                          f"Default {core.STATE_DIR / 'previews'}")] = None,
+    ) -> str:
+        try:
+            p = await replay.preview_excerpts(url, domains=domains, queries=queries, save_dir=save_dir)
+        except core.TraceError as e:
+            raise ToolError(str(e))
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(f"preview_excerpts failed: {type(e).__name__}: {str(e)[:300]}. Retry once.")
+        return p["summary"]
 
     return mcp
 

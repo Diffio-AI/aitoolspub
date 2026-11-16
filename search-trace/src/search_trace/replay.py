@@ -115,12 +115,29 @@ def _undev(text: str, domains: dict[str, str]) -> str:
 # ---------------------------------------------------------------- Exa
 
 
+def _fresh(url: str) -> str:
+    """url with a unique query parameter, so Exa crawls it now. livecrawl "always" alone isn't enough: a URL
+    crawled moments before comes back from Exa's cache (seen 2026-11-16, also with maxAgeHours 0), which would show
+    the page from before a dev deploy. Static hosts ignore the parameter."""
+    return f"{url}{'&' if '?' in url else '?'}exa_fresh={time.time_ns()}"
+
+
+def _unfresh(text: str) -> str:
+    """Takes the parameter back out of what Exa returns (a page without a title gets its URL as the title)."""
+    return re.sub(r"[?&]exa_fresh=\d+", "", text or "")
+
+
 class Exa:
     def __init__(self, client: httpx.AsyncClient, key: str):
         self.c, self.key, self.cost = client, key, 0.0
 
     async def _post(self, path: str, body: dict) -> dict:
-        r = await self.c.post(f"https://api.exa.ai/{path}", headers={"x-api-key": self.key}, json=body, timeout=120)
+        for attempt in range(5):
+            r = await self.c.post(f"https://api.exa.ai/{path}", headers={"x-api-key": self.key}, json=body,
+                                  timeout=120)
+            if r.status_code != 429:
+                break
+            await asyncio.sleep(2 * (attempt + 1))
         if r.status_code != 200:
             raise core.TraceError(f"Exa {path} answered {r.status_code}: {r.text[:200]}")
         j = r.json()
@@ -133,17 +150,23 @@ class Exa:
         return [{"url": x["url"], "title": x.get("title") or "", "text": "\n...\n".join(x.get("highlights") or [])}
                 for x in j.get("results") or []]
 
-    async def excerpt(self, url: str, query: str, max_chars: int) -> tuple[str, str]:
-        """Exa's query-matched passages from a live crawl of url, about max_chars long -> (text, title)."""
-        j = await self._post("contents", {"urls": [url], "livecrawl": "always",
-                                          "highlights": {"query": query, "maxCharacters": max(max_chars, 200)}})
+    async def excerpt(self, url: str, query: str) -> tuple[str, str]:
+        """Exa's query-matched passages from a live crawl of url, at the length Exa picks -> (text, title).
+
+        OpenRouter passes on Exa's search highlights unchanged, at Exa's adaptive length (its docs, and measured
+        2026-11-16: no trimming or summarizing of its own). A page that isn't in Exa's index (a dev page) can only
+        go through /contents; with a live crawl and no length cap, its passages match OpenRouter's excerpt about as
+        well as OpenRouter matches itself on a rerun (~75% of the wording), but run about twice as long. Capping
+        the length to the original excerpt's made Exa pick other passages (~55%)."""
+        j = await self._post("contents", {"urls": [_fresh(url)], "livecrawl": "always",
+                                          "highlights": {"query": query}})
         res = (j.get("results") or [{}])[0]
-        return "\n...\n".join(res.get("highlights") or []), res.get("title") or ""
+        return _unfresh("\n...\n".join(res.get("highlights") or [])), _unfresh(res.get("title") or "")
 
     async def page(self, url: str) -> tuple[str, str]:
-        j = await self._post("contents", {"urls": [url], "livecrawl": "always", "text": True})
+        j = await self._post("contents", {"urls": [_fresh(url)], "livecrawl": "always", "text": True})
         res = (j.get("results") or [{}])[0]
-        return res.get("text") or "", res.get("title") or ""
+        return _unfresh(res.get("text") or ""), _unfresh(res.get("title") or "")
 
 
 # ---------------------------------------------------------------- the recorded conversation
@@ -266,7 +289,7 @@ class OpenRouterSearch:
 class Arm:
     """One way of answering tool calls after the branch point. Searches come from OpenRouter (exact production
     results); on the domains, control keeps production's excerpt and variant gets the dev page's passages for the
-    same query (Exa live crawl, sized like production's excerpt). Fetches of domain pages read the production or
+    same query (Exa live crawl, Exa's own length: see Exa.excerpt). Fetches of domain pages read the production or
     dev page through Exa's live crawl in both arms."""
 
     def __init__(self, name: str, exa: Exa, domains: dict[str, str], ors: OpenRouterSearch | None = None):
@@ -275,8 +298,8 @@ class Arm:
     def source(self, url: str) -> str:
         return to_dev(url, self.domains) if self.name == "variant" else url
 
-    async def domain_excerpt(self, url: str, query: str, size: int) -> tuple[str, str]:
-        text, title = await self.exa.excerpt(self.source(url), query, size)
+    async def domain_excerpt(self, url: str, query: str) -> tuple[str, str]:
+        text, title = await self.exa.excerpt(self.source(url), query)
         return _undev(text, self.domains), _undev(title, self.domains)
 
     async def search(self, query: str) -> tuple[list[dict], dict[str, str], str]:
@@ -292,7 +315,7 @@ class Arm:
             if self.name == "control" and origin == "openrouter":
                 notes[r["url"]] = "control: production excerpt as OpenRouter gave it"
             else:
-                r["text"], _ = await self.domain_excerpt(r["url"], query, len(r["text"]) or 1000)
+                r["text"], _ = await self.domain_excerpt(r["url"], query)
                 notes[r["url"]] = f"{self.name}: {'dev' if self.name == 'variant' else 'production'} page re-extracted"
         return results, notes, origin
 
@@ -376,15 +399,25 @@ def _outcome(run: dict, domains: dict[str, str]) -> dict:
     # The answer's lines that name or link the domain, verbatim: a link can be a warning as easily as a pick.
     mentions = [ln.strip() for ln in run["answer"].splitlines()
                 if any(lb in ln.lower() for lb in labels) or any(d in ln.lower() for d in domains)]
+    # What the model thought about the domain on the way: its reasoning's sentences naming it, verbatim.
+    thought = [sent.strip() for st in run["steps"] if st["type"] == "reasoning"
+               for sent in re.split(r"(?<=[.!?])\s+|\n+", st["text"])
+               if sent.strip() and (any(lb in sent.lower() for lb in labels) or any(d in sent.lower() for d in domains))]
     return {"cited": cited, "named_in_answer": named, "fetched": fetched, "seen_in_new_searches": seen,
-            "mentions": mentions}
+            "mentions": mentions, "reasoning_mentions": thought}
 
 
 # ---------------------------------------------------------------- test_page_change
 
 
 async def test_page_change(domains: dict[str, str], trace_id: str | None = None, query: str | None = None,
-                           runs: int = 3, save_dir: str | None = None) -> dict:
+                           runs: int = 3, save_dir: str | None = None, insert_url: str | None = None,
+                           insert_rank: int = 3, insert_query: str | None = None,
+                           insert_control: str = "absent") -> dict:
+    """Swap mode (no insert_url): the open model saw a page on the domains; swap its text for the dev page's.
+    Insert mode (insert_url): add insert_url to one of the trace's searches at insert_rank, as if it ranked there;
+    control is the search as recorded ("absent") or with the production page inserted the same way ("production"),
+    variant has the dev page inserted."""
     if not domains:
         raise core.TraceError("domains is empty: map each production domain to its dev host, e.g. "
                               "{'example.com': 'dev.example.com'}.")
@@ -410,12 +443,36 @@ async def test_page_change(domains: dict[str, str], trace_id: str | None = None,
         raise core.TraceError(f"Trace {trace['trace_id']} has no open-model response to replay "
                               f"({trace['open_model'].get('error') or 'missing'}).")
     turns = recorded_turns(raw)
-    branch = find_branch(turns, domains)
-    if not branch:
-        raise core.TraceError(f"In trace {trace['trace_id']} the open model never saw a page on "
-                              f"{', '.join(domains)} (in results or fetched), so there's nothing to swap. Use "
-                              f"sample_queries to see which queries the page would need to rank for.")
-    ti, hits = branch
+    insert = None
+    if insert_url:
+        insert_url = insert_url.strip()
+        if not insert_url.startswith("http") or not match_domain(insert_url, domains):
+            raise core.TraceError(f"insert_url must be a full URL on {', '.join(domains)} (got '{insert_url}').")
+        if insert_control not in ("absent", "production"):
+            raise core.TraceError("insert_control must be 'absent' or 'production'.")
+        searches = [(i, j, c) for i, t in enumerate(turns) for j, c in enumerate(t["calls"]) if c["kind"] == "search"]
+        if insert_query:
+            want = " ".join(insert_query.lower().split())
+            searches = [x for x in searches if " ".join(x[2]["args"].get("query", "").lower().split()) == want]
+        if not searches:
+            listed = "; ".join(c["args"].get("query", "") for t in turns for c in t["calls"] if c["kind"] == "search")
+            raise core.TraceError(f"No search in trace {trace['trace_id']} matches insert_query '{insert_query}'. "
+                                  f"Its searches: {listed or 'none'}.")
+        ti, ci, c = searches[0]
+        if any(core.norm_url(r["url"]) == core.norm_url(insert_url) for r in c["results"]):
+            raise core.TraceError(f"{insert_url} is already in the results for '{c['args']['query']}': leave out "
+                                  f"insert_url to swap its text instead.")
+        insert = {"call": ci, "rank": max(1, min(int(insert_rank), len(c["results"]) + 1)),
+                  "query": c["args"]["query"], "keep": len(c["results"])}
+        hits = []
+    else:
+        branch = find_branch(turns, domains)
+        if not branch:
+            raise core.TraceError(f"In trace {trace['trace_id']} the open model never saw a page on "
+                                  f"{', '.join(domains)} (in results or fetched), so there's nothing to swap. Pass "
+                                  f"insert_url to add the page to one of its searches as if it ranked there; "
+                                  f"sample_queries shows which queries the page would need to rank for.")
+        ti, hits = branch
     model = trace["open_model"].get("model") or core.OPEN_MODEL
     instructions = trace["open_model"].get("instructions") or core.OPEN_INSTRUCTIONS
 
@@ -448,16 +505,31 @@ async def test_page_change(domains: dict[str, str], trace_id: str | None = None,
             else:
                 r = c["results"][ri]
                 q = c["args"]["query"]
-                ctext, _ = await arms["control"].domain_excerpt(r["url"], q, len(r["text"]) or 1000)
-                vtext, _ = await arms["variant"].domain_excerpt(r["url"], q, len(r["text"]) or 1000)
+                (ctext, _), (vtext, _) = await asyncio.gather(arms["control"].domain_excerpt(r["url"], q),
+                                                              arms["variant"].domain_excerpt(r["url"], q))
                 swaps.append({"kind": "search", "call": ci, "rank": ri + 1, "query": q, "url": r["url"],
                               "original": r["text"], "control": ctext, "variant": vtext,
                               "dev_url": to_dev(r["url"], domains)})
 
+        if insert:
+            u, q = insert_url, insert["query"]
+            (vtext, vtitle), (ctext, ctitle) = await asyncio.gather(
+                arms["variant"].domain_excerpt(u, q),
+                arms["control"].domain_excerpt(u, q) if insert_control == "production" else asyncio.sleep(0, ("", "")))
+            swaps.append({"kind": "insert", "call": insert["call"], "rank": insert["rank"], "query": q, "url": u,
+                          "keep": insert["keep"], "original": "", "control": ctext, "control_title": ctitle,
+                          "variant": vtext, "variant_title": vtitle, "dev_url": to_dev(u, domains),
+                          "control_mode": insert_control})
+
         def branch_messages(arm: str) -> list[dict]:
             calls = [json.loads(json.dumps(c)) for c in bt["calls"]]
             for s in swaps:
-                if s["kind"] == "fetch":
+                if s["kind"] == "insert":
+                    if s[arm]:
+                        res = calls[s["call"]]["results"]
+                        res.insert(s["rank"] - 1, {"url": s["url"], "title": s[f"{arm}_title"], "text": s[arm]})
+                        del res[s["keep"]:]   # as many results as the search really returned
+                elif s["kind"] == "fetch":
                     calls[s["call"]]["fetch"]["content"] = s[arm]
                 else:
                     calls[s["call"]]["results"][s["rank"] - 1]["text"] = s[arm]
@@ -500,11 +572,18 @@ async def test_page_change(domains: dict[str, str], trace_id: str | None = None,
             "later_searches": dict(search_origins)}
     swap_md = []
     for n, s in enumerate(swaps, 1):
-        where = (f"result #{s['rank']} for the search '{s['query']}'" if s["kind"] == "search" else "a page fetch")
+        where = (f"result #{s['rank']} for the search '{s['query']}'" if s["kind"] == "search" else
+                 f"inserted as result #{s['rank']} for the search '{s['query']}'" if s["kind"] == "insert" else
+                 "a page fetch")
         swap_md.append(f"# Swap {n}: {s['url']} ({where})\nDev source: {s['dev_url']}\n")
         for k in ("original", "control", "variant"):
+            if s["kind"] == "insert" and k == "original":
+                continue
+            if s["kind"] == "insert" and k == "control" and not s[k]:
+                swap_md.append("## Control: not inserted (the search as recorded)\n")
+                continue
             label = {"original": "Original: what the model actually saw (OpenRouter)",
-                     "control": "Control: production page re-extracted by Exa live crawl",
+                     "control": "Control: production page re-extracted by Exa live crawl (Exa's own length)",
                      "variant": "Variant: dev page extracted the same way"}[k]
             swap_md.append(f"## {label} ({len(s[k])} chars)\n" + "\n".join("> " + ln for ln in s[k].splitlines())
                            + "\n")
@@ -515,6 +594,105 @@ async def test_page_change(domains: dict[str, str], trace_id: str | None = None,
     (base / "summary.md").write_text(summary)
     test["summary"] = summary
     return test
+
+
+# ---------------------------------------------------------------- preview_excerpts
+
+
+def _grams(text: str) -> set[tuple[str, ...]]:
+    w = re.findall(r"[a-z0-9']+", text.lower())
+    return {tuple(w[i:i + 4]) for i in range(len(w) - 3)}
+
+
+def cover(target: str, candidate: str) -> float:
+    """Share of target's wording (word 4-grams) found in candidate."""
+    t = _grams(target)
+    return round(len(t & _grams(candidate)) / len(t), 2) if t else 0.0
+
+
+def recorded_excerpts(url: str, limit: int = 12) -> list[dict]:
+    """Every time a cached trace's open model got url in a search, newest first: [{query, excerpt, trace_id}]."""
+    want = core.norm_url(url)
+    out, seen = [], set()
+    for f in sorted(core.STATE_DIR.glob("*/trace.json"), reverse=True):
+        try:
+            t = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        for st in (t.get("open_model") or {}).get("steps") or []:
+            if st.get("type") != "search":
+                continue
+            for r in st.get("results") or []:
+                if core.norm_url(r.get("url") or "") == want and st["query"] not in seen:
+                    seen.add(st["query"])
+                    out.append({"query": st["query"], "excerpt": r.get("excerpt") or "", "trace_id": t["trace_id"]})
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+async def preview_excerpts(url: str, domains: dict[str, str] | None = None, queries: list[str] | None = None,
+                           save_dir: str | None = None) -> dict:
+    """For each query: the passages Exa picks from the production page and from its dev version now, and what the
+    open model actually got from the page in cached traces (when it did)."""
+    url = (url or "").strip()
+    if not url.startswith("http"):
+        raise core.TraceError("url must be a full production URL, e.g. https://example.com/pricing.")
+    domains = {k.strip().lower(): v.strip().lower().removeprefix("https://").rstrip("/")
+               for k, v in (domains or {}).items()}
+    if domains and not match_domain(url, domains):
+        raise core.TraceError(f"{url} isn't on any of the domains {', '.join(domains)}.")
+    exa_key = core._read_key("EXA_API_KEY", "exa.key")
+    if not exa_key:
+        raise core.TraceError(f"Needs an Exa key (EXA_API_KEY or {core.KEYS_DIR / 'exa.key'}).")
+    recorded = {r["query"]: r for r in recorded_excerpts(url)}
+    qs = [q.strip() for q in (queries or []) if q and q.strip()] or list(recorded)
+    if not qs:
+        raise core.TraceError(f"No queries given, and no cached trace has {url} in its open model's results. Pass "
+                              f"queries: the searches a model would run (sample_queries shows them).")
+    qs = list(dict.fromkeys(qs))[:20]
+    dev_url = to_dev(url, domains) if domains else None
+    sem = asyncio.Semaphore(3)
+    t0 = time.monotonic()
+    async with httpx.AsyncClient() as client:
+        exa = Exa(client, exa_key)
+
+        async def get(u: str, q: str) -> str:
+            async with sem:
+                try:
+                    text, _ = await exa.excerpt(u, q)
+                except core.TraceError as e:
+                    return f"(failed: {e})"
+                return _undev(text, domains) if domains else text
+
+        async def one(q: str) -> dict:
+            prod, dev = await asyncio.gather(get(url, q), get(dev_url, q) if dev_url else asyncio.sleep(0, None))
+            rec = recorded.get(q)
+            row = {"query": q, "production": prod, "dev": dev,
+                   "recorded": rec["excerpt"] if rec else None, "recorded_trace": rec["trace_id"] if rec else None}
+            if rec:
+                row["recorded_in_production"] = cover(rec["excerpt"], prod)
+            if dev is not None:
+                row["dev_new"] = round(1 - cover(dev, prod), 2)
+            return row
+
+        rows = await asyncio.gather(*(one(q) for q in qs))
+        cost = exa.cost
+
+    now = datetime.now(UTC)
+    pid = f"{now:%Y%m%d-%H%M%S}-preview-{core.slug(url.split('://', 1)[-1], 40)}"
+    root = Path(save_dir).expanduser() if save_dir else core.STATE_DIR / "previews"
+    if not root.is_absolute():
+        raise core.TraceError(f"save_dir must be an absolute path (got '{save_dir}').")
+    root.mkdir(parents=True, exist_ok=True)
+    out = {"preview_id": pid, "url": url, "dev_url": dev_url, "rows": rows, "seconds": round(time.monotonic() - t0, 1),
+           "exa_cost_usd": round(cost, 4), "file": str(root / f"{pid}.md")}
+    from .render import render_preview
+    full, summary = render_preview(out)
+    Path(out["file"]).write_text(full)
+    (root / f"{pid}.json").write_text(json.dumps(out, ensure_ascii=False, indent=1))
+    out["summary"] = summary
+    return out
 
 
 # ---------------------------------------------------------------- sample_queries

@@ -6,7 +6,7 @@ doesn't analyse it.
 
 ## Tool (MCP server `search-trace`)
 
-Three tools: `trace_query`, `test_page_change` and `sample_queries` (below).
+Four tools: `trace_query`, `test_page_change`, `sample_queries` and `preview_excerpts` (below).
 
 `trace_query(query, engine="exa", save_dir=None, full=False)` runs the question through two independent AI web
 searches, at the same time, saves both full traces as files and returns a few lines saying what each engine did
@@ -52,7 +52,7 @@ Firecrawl cost 20-40x the others and was slower.
 The open model is given a short ChatGPT-search-like brief that asks for markdown-link citations (without it,
 DeepSeek links nothing); the trace prints it.
 
-## test_page_change and sample_queries (open model only)
+## test_page_change, sample_queries and preview_excerpts (open model only)
 
 These drive DeepSeek ourselves (OpenRouter chat completions with function tools) instead of through OpenRouter's
 server tools, using copies of OpenRouter's tools: the same names (`openrouter_web_search`, `openrouter_web_fetch`),
@@ -65,20 +65,41 @@ comes from Exa's live crawl. Key: `aitools/keys/exa.key` (or `EXA_API_KEY`).
 `test_page_change(domains, trace_id | query, runs=3, save_dir)`: finds the first step in a trace's open-model run
 where DeepSeek saw a page on one of the domains (a search result or a fetch), rebuilds the conversation up to it
 exactly as recorded (passing its reasoning back), swaps that page's text and lets DeepSeek carry on `runs` times
-per arm. Control: the production page re-extracted by Exa's live crawl (query-matched passages sized like the
-original excerpt, or the whole page for a fetch). Variant: the dev page (same path on the mapped host), extracted
+per arm. Control: the production page re-extracted by Exa's live crawl (query-matched passages at Exa's own length,
+or the whole page for a fetch). Variant: the dev page (same path on the mapped host), extracted
 the same way, with the dev host rewritten to production; the model sees the production URL. In later searches,
 control keeps production's excerpt for domain pages and variant gets the dev page's passages for that query; later
-fetches of domain pages read the production or dev page. The summary gives, per run, whether the answer linked the
-domain or named the brand in its own words, quoting its lines about it; files: `swaps.md`, `control-N.md`,
+fetches of domain pages read the production or dev page. The summary shows the passage the model read in the original and the variant,
+and per run whether the answer linked the domain or named the brand in its own words, quoting its lines and the
+model's reasoning sentences about it; files: `swaps.md`, `control-N.md`,
 `variant-N.md`, `test.json`, in `aitools/state/search-trace/tests/` or `save_dir`. `trace_id` can be a trace
 folder's absolute path.
+
+Insert mode (`insert_url`, `insert_rank=3`, `insert_query`, `insert_control="absent"`): for questions where the
+page doesn't show up. It adds the page to one of the trace's searches (the first, or the one whose query matches
+`insert_query`) at `insert_rank`, keeping the list's length, as if it ranked there. Variant: the dev page's passages
+for that query. Control: the search as recorded (`absent`: would ranking there win anything?) or with the
+production page inserted the same way (`production`: does the dev change win more once it ranks?). It can't make
+the page rank; that's search, not the model.
 
 `sample_queries(query, n=20)`: runs DeepSeek n times only until its first tool call and counts the queries (first
 turn only). About 3 seconds and $0.003 for 20.
 
-Limits found testing (2026-11-14): re-extraction picks different passages from the same production page than
-OpenRouter's did (similarity 0.39-0.52), so the control is "the same kind of excerpt", not the original; very short
+`preview_excerpts(url, domains, queries, save_dir)`: per query, the passages Exa picks from the production page and
+its dev version now, plus what the open model got from the page in cached traces (default queries: every query
+under which a cached trace got the URL). The fast loop while editing a page; a few seconds, ~$0.002 per page and
+query. Files in `aitools/state/search-trace/previews/` or `save_dir`.
+
+How the excerpts work (measured 2026-11-16 on 45-90 results from real traces): OpenRouter
+sends the model's query to Exa search (mode auto) and passes Exa's highlights on unchanged, at Exa's adaptive length
+(its docs say so; it doesn't trim or summarize). Exa's choice varies: the same query through OpenRouter hours later
+matched its earlier excerpt ~75% (4-gram overlap; 40 of 83 near-identical). A dev page isn't in Exa's index, so it
+can only go through `/contents`; with a live crawl and no length cap its passages match OpenRouter's ~75% too, about
+twice as long. Capping the length to the original excerpt's (what the replay did before) made Exa pick other
+passages (~55%). Exa's own search with OpenRouter's settings matches best (~88%) but only for indexed pages.
+
+Limits found testing (2026-11-14, -16): re-extraction approximates OpenRouter's passages (above), so the control is
+"the same kind of excerpt", not the original, and both arms see about twice as much of the page; very short
 excerpts (~250 chars) can come out as table fragments; a change only shows if the passages Exa picks for that
 query include it; it only works when the open model saw a page on the domain; OpenAI can't be replayed.
 A test whose continuations search again takes about a minute (each new query is a ~2-5 s OpenRouter call).
@@ -111,6 +132,7 @@ Models and country: `SEARCH_TRACE_OPENAI_MODEL`, `SEARCH_TRACE_OPEN_MODEL`, `SEA
 
 ```sh
 .venv/bin/search-trace "What is the best sheet music scanning app?" [--engine exa] [--save-dir DIR] [--full]
+.venv/bin/search-trace --preview https://example.com/pricing --dev example.com=dev.example.com
 ```
 
 ## Cost and time

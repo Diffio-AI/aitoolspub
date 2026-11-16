@@ -191,15 +191,32 @@ def render_test_summary(test: dict) -> str:
              f"including these tool calls is replayed exactly as recorded:")]
     for c in test["branch"]["steps_before"]:
         lines.append(f"  - {c['kind']}: {c['args'].get('query') or c['args'].get('url')}")
-    lines.append("Linked = the answer links a page on the domain, which can be a warning as easily as a pick: the "
-                 "quoted lines are each answer's lines naming the domain, verbatim.")
+    lines.append("Linked = the answer links a page on the domain, which can be a warning as easily as a pick. Quoted "
+                 "under each run, verbatim: the answer's lines naming the domain, and the sentences of the model's "
+                 "reasoning naming it (what it made of the page, and why it preferred others).")
     lines.append("Swapped at the branch point (control = production page re-extracted by Exa live crawl; variant = "
-                 "dev page extracted the same way; the model always sees the production URL):")
+                 "dev page extracted the same way; the model always sees the production URL). Exa picks the "
+                 "passages and their length, as it does for OpenRouter; these run about twice as long as what "
+                 "OpenRouter gives, and match its excerpt about as well as OpenRouter matches itself on a rerun.")
     for s in test["swaps"]:
+        if s["kind"] == "insert":
+            lines.append(f"  - INSERTED {s['url']} as result #{s['rank']} for '{s['query']}' (the trace's search "
+                         f"didn't return it; the result list keeps its length): control "
+                         + (f"has the production page inserted the same way ({len(s['control'])} chars)"
+                            if s["control"] else "is the search as recorded, without it")
+                         + f"; variant has the dev page ({len(s['variant'])} chars).")
+            for k in (("control", "variant") if s["control"] else ("variant",)):
+                text = " ".join(s[k].split())
+                lines.append(f"    {k} passage the model read: \"{text[:700]}{'…' if len(text) > 700 else ''}\"")
+            continue
         where = f"result #{s['rank']} for '{s['query']}'" if s["kind"] == "search" else "fetched page"
         lines.append(f"  - {s['url']} ({where}): original {len(s['original'])} chars, control {len(s['control'])}, "
                      f"variant {len(s['variant'])}; original vs control similarity "
                      f"{s['similarity_original_vs_control']}")
+        if s["kind"] == "search":
+            for k in ("original", "variant"):
+                text = " ".join(s[k].split())
+                lines.append(f"    {k} passage the model read: \"{text[:700]}{'…' if len(text) > 700 else ''}\"")
     lines.append("")
     for arm in ("control", "variant"):
         rs = [r for r in runs if r["arm"] == arm]
@@ -216,7 +233,10 @@ def render_test_summary(test: dict) -> str:
             lines.append(f"  - {r['file']}: linked {', '.join(o['cited']) or 'none'}; named in its own words: "
                          f"{'yes' if o['named_in_answer'] else 'no'}; domain pages fetched: {len(o['fetched'])}; "
                          f"new searches: {sum(s['type'] == 'search' for s in r['steps'])}")
-            lines += [f"      \"{m[:300]}\"" for m in o.get("mentions") or []]
+            lines += [f"      answer: \"{m[:300]}\"" for m in o.get("mentions") or []]
+            lines += [f"      reasoning: \"{m[:300]}\"" for m in (o.get("reasoning_mentions") or [])[:5]]
+            if not o.get("reasoning_mentions"):
+                lines.append("      reasoning: never names the domain")
     ls = test.get("later_searches") or {}
     if ls:
         lines.append("\nSearches after the branch point (shared by all runs): " + ", ".join(
@@ -248,3 +268,34 @@ def render_queries(r: dict) -> str:
     if fetches:
         lines.append("\nFetched straight away instead of searching: " + ", ".join(fetches))
     return "\n".join(lines)
+
+
+def render_preview(p: dict) -> tuple[str, str]:
+    """-> (the full preview file, the short summary the tool returns)."""
+    head = [f"Excerpt preview for {p['url']}" + (f" (dev: {p['dev_url']})" if p["dev_url"] else ""),
+            ("For each query, the passages Exa picks from the page now (live crawl, Exa's own length), which is what "
+             "OpenRouter passes the open model when the page is a search result. They run about twice as long as "
+             "what the model gets, and Exa's choice varies between calls: OpenRouter's excerpt matches its own rerun "
+             "about 75% of the time, so read these as what the page offers for the query, not the exact text. "
+             "'Recorded' is what the open model actually got from this page in a cached trace; 'recorded in "
+             "production now' is how much of it today's production passages contain (high = the preview is a good "
+             "guide for this page and query; low = the page or Exa's index has changed since).")]
+    lines, full = list(head), list(head)
+    for r in p["rows"]:
+        bits = [f"production {len(r['production'])} chars"]
+        if r["dev"] is not None:
+            bits.append(f"dev {len(r['dev'])} chars, {round(r['dev_new'] * 100)}% new wording vs production")
+        if r["recorded"] is not None:
+            bits.append(f"recorded {len(r['recorded'])} chars ({r['recorded_trace']}), "
+                        f"{round(r['recorded_in_production'] * 100)}% of it in production now")
+        lines.append(f"\n- '{r['query']}': " + "; ".join(bits))
+        show = r["dev"] if r["dev"] is not None else r["production"]
+        text = " ".join(show.split())
+        lines.append(f"    {'dev' if r['dev'] is not None else 'production'}: \"{text[:500]}{'…' if len(text) > 500 else ''}\"")
+        full.append(f"\n# {r['query']}\n" + "; ".join(bits))
+        for k, label in (("recorded", "Recorded: what the open model got"), ("production", "Production now"),
+                         ("dev", "Dev now")):
+            if r[k] is not None:
+                full.append(f"\n## {label} ({len(r[k])} chars)\n" + "\n".join("> " + ln for ln in r[k].splitlines()))
+    lines.append(f"\n{p['seconds']}s, ${p['exa_cost_usd']:.4f} Exa. Every passage in full: {p['file']}")
+    return "\n".join(full) + "\n", "\n".join(lines)
