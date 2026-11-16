@@ -1,0 +1,55 @@
+"""search-trace from the shell: the same output as the MCP tool.
+
+  search-trace "What is the best app for scanning sheet music?" [--engine exa|parallel|perplexity|firecrawl]
+               [--save-dir DIR] [--full]
+  search-trace "<question>" --sample-queries 20
+  search-trace ["<question>"] --test-change example.com=dev.example.com [--trace-id ID] [--runs 3]
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+from pathlib import Path
+
+from . import core, replay
+from .render import render_full, render_queries, summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="search-trace", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("query", nargs="?")
+    ap.add_argument("--engine", default=core.DEFAULT_ENGINE, choices=core.ENGINES)
+    ap.add_argument("--save-dir", help=f"directory for the trace folder (default {core.STATE_DIR})")
+    ap.add_argument("--full", action="store_true", help="print every file's text, not just the summary")
+    ap.add_argument("--sample-queries", type=int, metavar="N", help="sample the open model's first searches N times")
+    ap.add_argument("--test-change", nargs="+", metavar="PROD=DEV", help="replay with dev pages, e.g. "
+                    "example.com=dev.example.com")
+    ap.add_argument("--trace-id", help="for --test-change: the trace to replay (else the query's trace)")
+    ap.add_argument("--runs", type=int, default=3, help="for --test-change: continuations per arm")
+    a = ap.parse_args(argv)
+    try:
+        if a.sample_queries:
+            print(render_queries(asyncio.run(replay.sample_queries(a.query or "", n=a.sample_queries))))
+            return 0
+        if a.test_change:
+            domains = dict(x.split("=", 1) for x in a.test_change)
+            save = str(Path(a.save_dir).expanduser().resolve()) if a.save_dir else None
+            print(asyncio.run(replay.test_page_change(domains, trace_id=a.trace_id, query=a.query, runs=a.runs,
+                                                      save_dir=save))["summary"])
+            return 0
+        if not a.query:
+            ap.error("give a query")
+        save = str(Path(a.save_dir).expanduser().resolve()) if a.save_dir else None
+        trace = core.run(a.query, engine=a.engine, save_dir=save)
+        print(render_full(trace) if a.full else summary(trace))
+    except core.TraceError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

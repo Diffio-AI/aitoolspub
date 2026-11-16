@@ -1,0 +1,17 @@
+# Optional: a real NVIDIA GPU for WebGL instead of SwiftShader (needs nvidia-container-toolkit).
+# Turn it on with COMPOSE_FILE=docker-compose.yml:gpu.yml in .env. A broken NVIDIA runtime (say, after a driver
+# update) stops the containers from starting: take gpu.yml out of COMPOSE_FILE to get going again.
+x-gpu: &gpu
+  gpus:
+    - driver: nvidia
+      device_ids: ["${GPU_DEVICE:-0}"]
+      capabilities: [gpu, graphics, utility]
+  environment:
+    # The NVIDIA graphics libraries (Vulkan ICD, EGL) are only mounted into the container when asked for.
+    NVIDIA_DRIVER_CAPABILITIES: "graphics,utility"
+    # Xvfb has no GPU GLX, so ANGLE renders through the NVIDIA Vulkan driver.
+    CHROME_ARGS: "--use-angle=vulkan"
+
+services:
+  steel-testing: *gpu
+  steel-production: *gpu

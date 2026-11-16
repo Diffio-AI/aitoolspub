@@ -1,0 +1,25 @@
+# agent-mail configuration. Copy to config.toml (or point AGENT_MAIL_CONFIG at it).
+# Relative paths are resolved against this file's directory.
+
+[service]
+key_file = "/path/to/gmail-service-account.json"  # domain-wide delegation, gmail.modify scope; never copied or logged
+state_dir = "state"            # SQLite mirror, attachments, token hashes (created 0700)
+listen_host = "127.0.0.1"      # MCP endpoint: http://127.0.0.1:8766/mcp
+listen_port = 8766
+backfill_days = 0              # 0 = mirror all mail; N = only the last N days (raising it later back-fills)
+catchup_minutes = 15           # periodic history sync in case a push is lost
+watch_renew_hours = 24         # Gmail watches expire after 7 days
+attachment_max_bytes = 10485760  # larger attachments are fetched on demand
+
+[pubsub]                       # Gmail push; leave project empty to rely on catch-up syncs only
+project = "my-gcp-project"
+topic = "gmail-agent-mail"     # or the topic another service already watches these mailboxes with
+subscription = "agent-mail-pull"
+
+# One [[mailbox]] per primary Workspace user. Send-as aliases are discovered from Gmail automatically; list
+# extra ones here only to set a display name.
+[[mailbox]]
+address = "someone@example.com"
+display_name = "Someone"
+# send = false                 # mirror and read only
+# aliases = [{ address = "alias@example.com", display_name = "Someone" }]

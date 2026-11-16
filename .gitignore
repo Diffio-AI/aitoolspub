@@ -1,0 +1,17 @@
+# secrets
+keys/
+steel/secrets/
+steel/.env
+mail/config.toml
+# downloaded at setup (steel/get-nopecha.sh)
+steel/extensions/*
+!steel/extensions/.gitkeep
+# runtime state
+state/
+mail/state/
+steel/profiles/
+# python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

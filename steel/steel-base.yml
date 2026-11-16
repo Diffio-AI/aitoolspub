@@ -1,0 +1,65 @@
+# Shared settings for every Steel instance. Not started on its own: the
+# services in docker-compose.yml pull this in with `extends`, and Compose
+# merges environment and volumes key by key, so instances only add their own.
+services:
+  steel:
+    # Steel only publishes a moving `latest` tag, so the image is pinned by digest
+    # (steel-browser API 0.5.3, Chromium 156.0.8078.47, built 2026-10-29).
+    image: ghcr.io/steel-dev/steel-browser@sha256:e2fc0b3379f78fd38113ffc606829dc6c6d46fd516e68482719fd17360f00bcd
+    restart: unless-stopped
+    entrypoint: ["/usr/bin/tini", "--", "/steel/steel-init.sh"]
+    stop_grace_period: 30s
+    shm_size: 1gb
+    # A cap per Chrome. Renderers run with oom_score_adj 300, so at the cap the kernel kills the biggest tab (it shows
+    # "Aw, Snap!"), not Chrome or Steel's API. Without one, tabs nobody closed grew one Chrome to 17 GB (2026-11-12).
+    # agent-browser-janitor (browser/) closes abandoned tabs and restarts a bloated idle Chrome.
+    mem_limit: 8g
+    memswap_limit: 8g
+    # No GPU here: WebGL runs on SwiftShader. gpu.yml adds an NVIDIA GPU (see README.md, "GPU").
+    environment:
+      # Headful Chrome on Xvfb (started by steel-init.sh) instead of --headless=new.
+      CHROME_HEADLESS: "false"
+      # A CDP call that times out while Steel instruments a new target (an ad
+      # iframe: "Network.enable timed out", 2026-11-01) rejects with no handler,
+      # and Node's default for that is to exit, which restarts the container and
+      # closes every open page. Warn instead: that target just goes without
+      # Steel's logging.
+      NODE_OPTIONS: "--unhandled-rejections=warn"
+      # Steel's fingerprint injection is random per launch, racy for pages
+      # created over CDP, and internally inconsistent (e.g. aarch64 UA on an
+      # x86_64 platform). With persistent logins a stable, real fingerprint is
+      # better, so it is off.
+      SKIP_FINGERPRINT_INJECTION: "true"
+      CHROME_USER_DATA_DIR: /data/profile
+      # Keep it matching where the machine's IP is (set TZ_NAME in .env).
+      TZ: ${TZ_NAME:-UTC}
+      DEFAULT_TIMEZONE: ${TZ_NAME:-UTC}
+      # Steel passes --disable-gpu (and --use-gl=swiftshader when headful), which
+      # leaves pages with no WebGL at all. Drop them.
+      FILTER_CHROME_ARGS: "--disable-gpu --use-gl=swiftshader"
+      # Space-separated extra Chrome flags. Software WebGL without a GPU; gpu.yml switches to --use-angle=vulkan.
+      CHROME_ARGS: "--enable-unsafe-swiftshader"
+      # Captcha solver, loaded by steel-init.sh: a directory under ./extensions
+      # (pinned NopeCHA automation build, fetched by get-nopecha.sh). Set CAPTCHA_EXTENSION in .env
+      # to turn it on; empty (the default) runs without a captcha solver.
+      CAPTCHA_EXTENSION: ${CAPTCHA_EXTENSION:-}
+      # API key file, written into a container-local copy of the extension at
+      # start. Missing or empty = NopeCHA's keyless free tier.
+      CAPTCHA_KEY_FILE: /run/steel-secrets/nopecha_api_key
+    volumes:
+      - ./steel-init.sh:/steel/steel-init.sh:ro
+      - ./chrome-policy.json:/etc/chromium/policies/managed/10_aitools.json:ro
+      - ./extensions:/extensions:ro
+      - ./secrets:/run/steel-secrets:ro
+      # Live viewer with paste (ctrl+v) and copy (ctrl+c) working when opened directly; Steel's own only works
+      # embedded in its web app. Patched copy of the image's template: see README.md, "Live viewer".
+      - ./viewer/live-session-streamer.ejs:/app/api/build/templates/live-session-streamer.ejs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }

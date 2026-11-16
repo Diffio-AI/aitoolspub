@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-mail"
+version = "0.1.0"
+description = "Always-on Gmail mirror (SQLite + FTS5) with MCP email tools for Claude Code: search, grep, read, wait for, send, reply"
+requires-python = ">=3.12"
+dependencies = [
+    "google-auth>=2.62.0",
+    "mcp>=2.3.0",
+    "requests>=2.34.2",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+agent-mail = "agent_mail.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_mail"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1",
+    "ruff>=0.17.3",
+]

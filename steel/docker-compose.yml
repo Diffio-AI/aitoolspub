@@ -1,0 +1,43 @@
+# Self-hosted Steel browsers (https://github.com/steel-dev/steel-browser) shared by every Claude Code session on
+# this host through the browser MCP (../browser). One Chrome per profile: Steel runs one Chrome with one
+# user-data-dir, so each profile is its own instance. Every agent session is its own window in the profile's
+# Chrome, so a site signed into once is signed in for every session that uses that profile.
+#
+#   steel-testing     profile "testing" (the default): everyday agent work, test accounts
+#   steel-production  profile "production": the user's primary accounts, for real publishing
+#
+# Ports (127.0.0.1 only), per instance:
+#   310x  Steel API, UI (/ui), live viewer and CDP websocket (ws://localhost:310x/)
+#   930x  raw Chrome DevTools (only used by the DevTools inspector link)
+#
+# The browser MCP finds the profiles in profiles.json. Shared settings (image digest, GPU, NopeCHA, stealth)
+# live in steel-base.yml. See README.md.
+
+name: agent-steel
+
+services:
+  steel-testing:
+    extends: { file: steel-base.yml, service: steel }
+    container_name: steel-testing
+    hostname: steel-testing
+    ports:
+      - "127.0.0.1:3103:3000"
+      - "127.0.0.1:9303:9223"
+    environment:
+      DOMAIN: localhost:3103
+      CDP_DOMAIN: localhost:9303
+    volumes:
+      - ./profiles/testing:/data/profile
+
+  steel-production:
+    extends: { file: steel-base.yml, service: steel }
+    container_name: steel-production
+    hostname: steel-production
+    ports:
+      - "127.0.0.1:3104:3000"
+      - "127.0.0.1:9304:9223"
+    environment:
+      DOMAIN: localhost:3104
+      CDP_DOMAIN: localhost:9304
+    volumes:
+      - ./profiles/production:/data/profile

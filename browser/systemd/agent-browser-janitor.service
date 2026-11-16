@@ -1,0 +1,9 @@
+[Unit]
+Description=agent-browser-janitor: close abandoned and idle tabs in the Steel Chromes, restart a bloated idle one
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__AITOOLS_DIR__/browser/.venv/bin/agent-browser-janitor
+TimeoutStartSec=300

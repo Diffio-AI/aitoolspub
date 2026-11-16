@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "search-trace"
+version = "0.1.0"
+description = "Trace how an AI search engine answers a query: OpenAI web search trace plus an open-model replay with visible reasoning"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.28", "mcp==2.3.0", "pydantic>=2.11"]
+
+[project.scripts]
+search-trace = "search_trace.cli:main"
+search-trace-mcp = "search_trace.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/search_trace"]
+
+[tool.ruff]
+line-length = 120

@@ -1,0 +1,11 @@
+{
+  "testing": {
+    "cdp": "ws://localhost:3103/",
+    "default": true,
+    "about": "everyday agent work and test accounts"
+  },
+  "production": {
+    "cdp": "ws://localhost:3104/",
+    "about": "the user's own primary accounts, for real work done as them (publishing, account settings); use it only when the task calls for those accounts"
+  }
+}
